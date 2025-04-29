@@ -10,13 +10,13 @@ import numpy as np
 # data = np.concatenate([d0, d1, d2, d3])
 # diff = np.abs(full - data)
 
-demo = np.load("train951_demo.npz")['arr_0']
-data = np.load("train951.npz")['arr_0']
+demo = np.load("D:/datasets/RepCount/tokens/stu1_0_rgb.npz")['arr_0']
+# data = np.load("train951.npz")['arr_0']
 
-diff = np.abs(demo - data)
-diff_max = np.max(diff)
-diff_avg = np.average(diff)
+# diff = np.abs(demo - data)
+# diff_max = np.max(diff)
+# diff_avg = np.average(diff)
 
-print("diff max = ", diff_max)
+print("Done")
 
 # 实际测试结果，分段加载（chunk_size=16） 和 一次性加载(以stu1_10.mp4为例， chunk_size设为60)数据是一致的

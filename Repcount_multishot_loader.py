@@ -19,11 +19,8 @@ class Rep_count(torch.utils.data.Dataset):
                  split="train",
                  add_noise= False,
                  num_frames=512,
-                 tokens_dir = "D:/datasets/ESCount/saved_VideoMAE_tokens_RepCount",
-                 
-                 # TODO: 修改exemplar
-                 exemplar_dir = "D:/datasets/ESCount/exemplar_VideoMAE_tokens_RepCount",
-                 
+                 video_tokens_dir = "D:/datasets/RepCount/tokens_rgb",
+                 pose_tokens_dir = "D:/datasets/RepCount/tokens_pose",
                  select_rand_segment=True,
                  compact=False,
                  lim_constraint=np.inf,
@@ -36,11 +33,8 @@ class Rep_count(torch.utils.data.Dataset):
         
         self.num_frames=num_frames
         self.lim_constraint = lim_constraint
-        self.tokens_dir = tokens_dir
-        
-        # TODO: 修改exemplar
-        self.exemplar_dir = exemplar_dir
-        
+        self.video_tokens_dir = video_tokens_dir
+        self.pose_tokens_dir = pose_tokens_dir
         self.compact = compact
         self.select_rand_segment = select_rand_segment
         self.pool_tokens = pool_tokens_factor
@@ -63,7 +57,8 @@ class Rep_count(torch.utils.data.Dataset):
         self.df = self.df[self.df['count'] > 0] # remove no reps
         print(f"--- Loaded: {len(self.df)} videos for {self.split} --- " )
 
-        
+    
+    # TODO: 删除exemplar
     def load_tokens(self,path,is_exemplar,bounds=None, lim_constraint=np.inf, id=None, cycle_start_id=0, count=None, shot_num=1, get_overlapping_segments=False, segment_id=0):
         """
         loading video or exemplar tokens. 
@@ -162,9 +157,10 @@ class Rep_count(torch.utils.data.Dataset):
     def __getitem__(self, index):
         video_name = self.df.iloc[index]['name'].replace('.mp4', '.npz')
         action_type = self.df.iloc[index]['type']
-
         
         row = self.df.iloc[index]
+        
+        # 仅当test模式开启时，overlapping才设为true
         if self.get_overlapping_segments and self.split=='train':
             segment_id = np.random.randint(4)
         else:
@@ -180,28 +176,10 @@ class Rep_count(torch.utils.data.Dataset):
         else:
             lim_constraint = np.inf
 
-        if self.multishot:
-            if self.split == 'train':
-                # shot_num_ = 0
-                shot_num_ = np.random.randint(0,3)  ### number of examples. randomly sample between 0 to 3
-            else:
-                shot_num_ = 0  #### during inference use 0-shot
-        else:
-            shot_num_ = 1
-        
-        ### choosing examples from random videos with same class
-
-        if np.random.rand() < self.threshold and action_type != 'other' and self.split == 'train':   #### do this with probability 0.4
-            select_videos = self.df['name'][self.df['type'] == action_type].values      #### groups videos of the same action category
-            select_example_video = np.random.choice(select_videos)   ### randomly select a video from the group
-            exemplar_video_name = select_example_video.replace('.mp4', '.npz')   ### select exemplar from the selected video
-        else:
-            exemplar_video_name = video_name
-
         
         segment_start = row['segment_start']
-        segment_end = row['segment_end']  
-        num_frames = row['num_frames']   
+        segment_end = row['segment_end']
+        num_frames = row['num_frames']
         
         ### --- Creating density maps ---
         frame_ids = np.arange(num_frames)
@@ -227,28 +205,21 @@ class Rep_count(torch.utils.data.Dataset):
         durations = ends - starts
         durations = durations.astype(np.float32)
         durations[durations == 0] = np.inf
-        select_exemplar = durations.argmin()
-
-        ### Load exemplar tokens
-        examplar_path = f"{self.exemplar_dir}/{exemplar_video_name}"
-        if self.split == 'train':
-            example_rep, shot_num = self.load_tokens(examplar_path,True, cycle_start_id=cycle_start_id, shot_num=shot_num_)   ###load the exemplar tokens
-        else:
-            example_rep, shot_num = self.load_tokens(examplar_path,True, id = 0, shot_num=shot_num_)     #### changing the id can give you specific exemplars in the video. by default id=0, returns the first repetition
-        if shot_num_ == 0:
-            shot_num = 0
-        if example_rep.shape[1] == 0:
-            print(row)
+        
+        ### Load pose tokens
+        pose_path = f"{self.pose}"
+        
+        
         
         ### Load video tokens
-        video_path = f"{self.tokens_dir}/{video_name}"
+        video_path = f"{self.video_tokens_dir}/{video_name}"
         vid_tokens = self.load_tokens(video_path,False, (segment_start,segment_end), lim_constraint=lim_constraint, segment_id=segment_id, get_overlapping_segments=self.get_overlapping_segments) ###load the video tokens. lim_constraint for memory issues
         
 
         if not self.select_rand_segment:
             vid_tokens = vid_tokens
             gt_density = torch.from_numpy(gt_density).half() 
-            return vid_tokens, example_rep, gt_density, gt_density.sum(), self.df.iloc[index]['name'][:-4], list(vid_tokens[0].shape[-3:]), shot_num 
+            return vid_tokens, pose_tokens, gt_density, gt_density.sum(), self.df.iloc[index]['name'][:-4], list(vid_tokens[0].shape[-3:]), shot_num 
         
         T = row['num_frames'] ### number of frames in the video
         if T <= self.num_frames:
@@ -262,7 +233,7 @@ class Rep_count(torch.utils.data.Dataset):
         sampled_segments = einops.rearrange(sampled_segments, 'C t h w -> (t h w) C')
         gt = gt_density[(start//4): (end//4)]
 
-        return sampled_segments, example_rep, gt, gt.sum(), self.df.iloc[index]['name'][:-4], thw, shot_num
+        return sampled_segments, pose_tokens, gt, gt.sum(), self.df.iloc[index]['name'][:-4], thw, shot_num
         
 
     def __len__(self):

@@ -1,11 +1,8 @@
 import torch
 import torch.nn as nn
-
-torch.cuda.empty_cache()
 import numpy as np
 import os, sys
 from Repcount_multishot_loader import Rep_count
-
 from tqdm import tqdm
 from video_mae_cross_full_attention import SupervisedMAE
 from util.config import load_config
@@ -13,12 +10,11 @@ import timm.optim.optim_factory as optim_factory
 import argparse
 import wandb
 import torch.optim as optim
-import math
 import random
 import time
 
 torch.manual_seed(0)
-
+torch.cuda.empty_cache()
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2 ** 32
@@ -64,9 +60,14 @@ def get_args_parser():
     parser.add_argument('--precomputed', default=True, type=lambda x: (str(x).lower() == 'true'), help='flag to specify if precomputed tokens will be loaded')
     parser.add_argument('--data_path', default='', type=str, help='dataset path')
     parser.add_argument('--slurm_job_id', default=None, type=str, help='job id')
-    parser.add_argument('--tokens_dir', default='D:/datasets/ESCount_4090/saved_VideoMAEtokens_RepCount', type=str, help='ground truth density map directory')
-    parser.add_argument('--exemplar_dir', default='D:/datasets/ESCount_4090/exemplar_VideoMAEtokens_RepCount', type=str, help='ground truth density map directory')
-    parser.add_argument('--threshold', default=0.4, type=float, help='p, cut off to decide if select exemplar from different video')
+    
+    
+    parser.add_argument('--video_tokens_dir', default='D:/datasets/RepCount/tokens_rgb', type=str, help='ground truth density map directory')
+    parser.add_argument('--pose_tokens_dir', default='D:/datasets/RepCount/tokens_pose', type=str, help='tokens of poses')
+    # parser.add_argument('--exemplar_dir', default='D:/datasets/ESCount_4090/exemplar_VideoMAEtokens_RepCount', type=str, help='ground truth density map directory')
+    
+    # 选取因子p，用于设置是否在同类动作的不同视频中取数据
+    parser.add_argument('--threshold', default=0, type=float, help='p, cut off to decide if select exemplar from different video')
 
     parser.add_argument('--device', default='cuda', help='device to use for training / testing')
 
@@ -113,8 +114,8 @@ def main():
     create dataloaders
     '''
     dataset_train = Rep_count(split="train",
-                              tokens_dir=args.tokens_dir,
-                              exemplar_dir=args.exemplar_dir,
+                              video_tokens_dir=args.video_tokens_dir,
+                              pose_tokens_dir=args.pose_tokens_dir,
                               select_rand_segment=False,
                               compact=True,
                               pool_tokens_factor=args.token_pool_ratio,
@@ -124,8 +125,8 @@ def main():
                               threshold=args.threshold)
 
     dataset_valid = Rep_count(split="valid",
-                              tokens_dir=args.tokens_dir,
-                              exemplar_dir=args.exemplar_dir,
+                              video_tokens_dir=args.tokens_dir,
+                              pose_tokens_dir=args.exemplar_dir,
                               select_rand_segment=False,
                               compact=True,
                               pool_tokens_factor=args.token_pool_ratio,
@@ -135,8 +136,8 @@ def main():
                               density_peak_width=args.density_peak_width)
     
     dataset_test = Rep_count(split="test",
-                             tokens_dir=args.tokens_dir,
-                             exemplar_dir=args.exemplar_dir,
+                             video_tokens_dir=args.tokens_dir,
+                             pose_tokens_dir=args.exemplar_dir,
                              select_rand_segment=False,
                              compact=True,
                              pool_tokens_factor=args.token_pool_ratio,
@@ -179,9 +180,6 @@ def main():
     # scaler = NativeScaler()
     model = SupervisedMAE(cfg=cfg, use_precomputed=args.precomputed, token_pool_ratio=args.token_pool_ratio, iterative_shots=args.iterative_shots,
                           encodings=args.encodings, window_size=args.window_size).cuda()
-
-    if args.num_gpus > 1:
-        model = nn.parallel.DataParallel(model, device_ids=[i for i in range(args.num_gpus)])
 
     train_step = 0
     val_step = 0
