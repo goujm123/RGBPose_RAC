@@ -2,7 +2,7 @@ import numpy as np
 import os
 import torch
 import cv2
-from Rep_count import Rep_count
+from preprocess_data_loader import Rep_count
 from decord import VideoReader, cpu, gpu
 from video_mae_cross_full_attention import SupervisedMAE
 from util.config import load_config

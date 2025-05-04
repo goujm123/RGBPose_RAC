@@ -50,16 +50,23 @@ class Rep_count(torch.utils.data.Dataset):
         self.threshold = threshold  ## cutoff to decide if we should select exemplar from other videos of same class
 
         # ESCount使用的是自己处理过的标注文件，和原始标注有格式上的差别
-        csv_path = f'datasets/repcount/{self.split}_with_1.csv'
+        csv_path = f'datasets/repcount/{self.split}_with_fps.csv'
 
         self.df = pd.read_csv(csv_path)
 
+        # 过滤掉不符合要求的文件
         self.df = self.df[self.df['count'].notna()]
         self.df = self.df[self.df['num_frames'] > 64]
+        self.df = self.df[self.df['count'] > 0]  # remove no reps
+
+        # 过滤标注错误（最常见的是count 或者 cycle标注错误）
+        # train集
         self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu1_10.mp4'].index)
         self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu4_3.mp4'].index)
-        self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu4_5.mp4'].index)
-        # self.df = self.df[self.df['count'] > 0] # remove no reps
+        self.df = self.df.drop(self.df.loc[self.df['name'] == 'test118.mp4'].index)
+
+        # test集（标注错误，但为了和别的论文对比，先保留着）
+        # self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu4_5.mp4'].index)
 
         print(f"--- Loaded: {len(self.df)} videos for {self.split} --- ")
 
@@ -77,7 +84,7 @@ class Rep_count(torch.utils.data.Dataset):
         """
 
         try:
-            tokens = np.load(path)['arr_0']  # Load in format C x t x h x w
+            tokens = np.load(path)['arr_0']  # Load in format B x C x T x H x W
         except:
             print(f'Could not load {path}')
             exit(-1)
@@ -116,7 +123,7 @@ class Rep_count(torch.utils.data.Dataset):
         else:
             tokens = tokens[0::4]  # non overlapping segments
             tokens = einops.rearrange(tokens, 'S C T H W -> C (S T) H W')
-            tokens = tokens[:, low_bound:up_bound]
+            tokens = tokens[:, low_bound:up_bound]  # 因为 bound 是 8的倍数（1个clip被编码成 8*14*14），所以实际上就是选几个 clip 的问题
 
             tokens = torch.from_numpy(tokens)
             if self.pool_tokens < 1.0:
@@ -182,7 +189,6 @@ class Rep_count(torch.utils.data.Dataset):
         durations = durations.astype(np.float32)
         durations[durations == 0] = np.inf
 
-        shot_num = 3   # 选择最大3，但pose实际上和video一一对应
         ### Load video tokens
         video_path = f"{self.video_tokens_dir}/{video_name}"
         vid_tokens = self.load_tokens(video_path, False, (segment_start, segment_end), lim_constraint=lim_constraint, get_overlapping_segments=self.get_overlapping_segments)  ###load the video tokens. lim_constraint for memory issues
@@ -190,6 +196,8 @@ class Rep_count(torch.utils.data.Dataset):
         ### Load pose tokens
         pose_path = f"{self.pose_tokens_dir}/{pose_name}"
         pose_tokens = self.load_tokens(pose_path, True, (segment_start, segment_end), lim_constraint=lim_constraint, get_overlapping_segments=self.get_overlapping_segments)  ###load the video tokens. lim_constraint for memory issues
+
+        shot_num = vid_tokens.shape[-3]   # 由于pose和video一一对应，取最大的 clip/segment 数
 
         # 默认走这个流程
         if not self.select_rand_segment:

@@ -16,8 +16,6 @@ from util.pos_embed import get_2d_sincos_pos_embed
 from timm.models.layers import trunc_normal_
 
 
-# from models_crossvit import Attention
-
 class PatchEmbed3D(nn.Module):
     """ Video to Patch Embedding.
 
@@ -467,7 +465,7 @@ class SupervisedMAE(nn.Module):
         return x, thw
 
     def forward(self, vid, yi=None, thw=None, boxes=None, shot_num=1):
-
+        # video, pose/examplar， thw=[[N,14,14]], shot_num
         y1 = []
 
         ### extract latent representations
@@ -506,9 +504,9 @@ class SupervisedMAE(nn.Module):
 
         x = self.decoder_norm(x)
 
-        n, thw, c = x.shape
+        n, thw_n, c = x.shape  # 此处的 thw = N*14*14, 例如53*14*14=10388，内容上和输入参数相关，但不是一个变量
 
-        t = int(thw / (h * w))
+        t = int(thw_n / (h * w))
         x = x.reshape(n, t, h, w, c)
         B, D, H, W, C = x.shape
         window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)

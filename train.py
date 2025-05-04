@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os, sys
-from Repcount_multishot_loader import Rep_count
+from train_data_loader import Rep_count
 from tqdm import tqdm
 from video_mae_cross_full_attention import SupervisedMAE
 from util.config import load_config
@@ -30,7 +30,7 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=1, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=60, type=int)
-    parser.add_argument('--encodings', default='mae', type=str, help=['swin', 'mae'])
+    parser.add_argument('--encodings', default='mae', type=str, help="['swin', 'mae']")
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
     parser.add_argument('--only_test', default=False, help='Only testing')
@@ -91,7 +91,7 @@ def get_args_parser():
     parser.add_argument("--team", default="", type=str)
     parser.add_argument("--wandb_id", default='', type=str)
 
-    parser.add_argument("--token_pool_ratio", default=0.4, type=float)
+    parser.add_argument("--token_pool_ratio", default=1.0, type=float)
     parser.add_argument("--rho", default=0.7, type=float)
     parser.add_argument("--window_size", default=(4, 7, 7), type=int, nargs='+', help='window size for windowed self attention')
 
@@ -109,9 +109,7 @@ def main():
 
     cfg = load_config(args)
 
-    '''
-    create dataloaders
-    '''
+    # create dataloaders
     dataset_train = Rep_count(split="train",
                               video_tokens_dir=args.video_tokens_dir,
                               pose_tokens_dir=args.pose_tokens_dir,
@@ -178,11 +176,13 @@ def main():
     # scaler = torch.cuda.amp.GradScaler() # use mixed percision for efficiency
     # scaler = NativeScaler()
     model = SupervisedMAE(cfg=cfg, use_precomputed=args.precomputed, token_pool_ratio=args.token_pool_ratio, iterative_shots=args.iterative_shots,
-                          encodings=args.encodings, window_size=args.window_size).cuda()
+                          encodings="mae", window_size=args.window_size).cuda()
 
     train_step = 0
     val_step = 0
-    if args.only_test:  #### only for testing
+
+    # only for testing
+    if args.only_test:
         model.load_state_dict(torch.load(args.trained_model)['model_state_dict'])  ### load trained model
         videos = []
         loss = []
@@ -199,9 +199,9 @@ def main():
         with tqdm(total=len(dataloader), bar_format=bformat, ascii='░▒█') as pbar:
             for i, item in enumerate(dataloader):
                 if args.get_overlapping_segments:
-                    data, data2 = item[0][0], item[0][1]
+                    rgb, data2 = item[0][0], item[0][1]
                 else:
-                    data = item[0].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
+                    rgb = item[0].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
                 example = item[1].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
                 density_map = item[2].cuda().type(torch.cuda.FloatTensor).half() * args.scale_counts
                 actual_counts = item[3].cuda()  # B x 1
@@ -210,14 +210,14 @@ def main():
                 videos.append(video_name[0])
 
                 shot_num = item[6][0]
-                b, n, c = data.shape
+                b, n, c = rgb.shape
 
                 thw = item[5]
                 with torch.no_grad():
                     if args.get_overlapping_segments:
-                        data = data.cuda().type(torch.cuda.FloatTensor)
+                        rgb = rgb.cuda().type(torch.cuda.FloatTensor)
                         data2 = data2.cuda().type(torch.cuda.FloatTensor)
-                        pred1 = model(data, example, thw, shot_num=shot_num)
+                        pred1 = model(rgb, example, thw, shot_num=shot_num)
                         pred2 = model(data2, example, thw, shot_num=shot_num)
                         if pred1.shape != pred2.shape:
                             pred2 = torch.cat([torch.zeros(1, 4).cuda(), pred2], 1)
@@ -225,7 +225,7 @@ def main():
                             print('equal')
                         pred = (pred1 + pred2) / 2
                     else:
-                        pred = model(data, example, thw, shot_num=shot_num)  ### predict the density maps
+                        pred = model(rgb, example, thw, shot_num=shot_num)  ### predict the density maps
 
                 mse = ((pred - density_map) ** 2).mean(-1)
                 predict_counts = torch.sum(pred, dim=1).type(torch.FloatTensor).cuda() / args.scale_counts  #### scaling down by args.scale_counts
@@ -250,6 +250,7 @@ def main():
         print(f'RMSE: {np.sqrt((diff ** 2).mean())}')  ### calculating rmse
         return
 
+    # train
     if args.use_wandb:
         wandb_run = wandb.init(
             config=args,
@@ -273,7 +274,7 @@ def main():
 
     for epoch in range(args.epochs):
         torch.cuda.empty_cache()
-        # scheduler.step()
+        # scheduler.step()   # 新版本的torch中， scheduler.step() 要放到 optimizer.step() 后
         start_time = time.time()
 
         print(f"Epoch: {epoch:02d}")
@@ -309,14 +310,14 @@ def main():
                             val_step += 1
 
                         with torch.cuda.amp.autocast(enabled=True):
-                            data = item[0].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
-                            example = item[1].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
+                            rgb = item[0].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
+                            pose = item[1].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
                             density_map = item[2].cuda().type(torch.cuda.FloatTensor).half() * args.scale_counts  ###scaling up args.scale_counts.This helps in magnifying the loss
                             actual_counts = item[3].cuda()  # B x 1
                             thw = item[5]
                             shot_num = item[6][0]  ## number of shots
-                            b, n, c = data.shape
-                            y = model(data, example, thw, shot_num=shot_num)
+                            b, n, c = rgb.shape
+                            y = model(rgb, pose, thw, shot_num=shot_num)
 
                             if phase == 'train':
                                 mask = np.random.binomial(n=1, p=0.8, size=[1, density_map.shape[1]])  ### random masking of 20% density map
@@ -341,7 +342,6 @@ def main():
                                     predict_count.flatten().shape[0]  #### reduce the mean absolute error (mae loss)
 
                             if phase == 'train':
-
                                 loss1 = (loss + 1.0 * loss3) / args.accum_iter  ### mse between density maps + mae loss (loss3)
                                 loss1.backward()  ### call backward
                                 if (i + 1) % args.accum_iter == 0:  ### accumulate gradient
