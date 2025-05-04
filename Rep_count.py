@@ -56,69 +56,45 @@ class Rep_count(torch.utils.data.Dataset):
         self.split = split  # set the split to load
         self.jittering = jittering  # temporal jittering (augmentation)
         self.add_noise = add_noise  # add noise to frames (augmentation)
+
+        # 根据标注文件读取视频
         csv_path = f"datasets/repcount/{self.split}_with_fps.csv"
         self.df = pd.read_csv(csv_path)
+
+        # 过滤掉不符合要求的文件
         self.df = self.df[self.df['count'].notna()]
         self.df = self.df[self.df['num_frames'] > 64]
-
-        # 测试，只使用指定的这个文件，去掉其余的文件
-        # self.df = self.df.drop(self.df.loc[self.df['name'] != 'stu1_1.mp4'].index)
-
-        self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu1_10.mp4'].index)
         self.df = self.df[self.df['count'] > 0]  # remove no reps
+
+        # 过滤标注错误（最常见的是count 或者 cycle标注错误）
+        # train集
+        self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu1_10.mp4'].index)
+        self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu4_3.mp4'].index)
+        self.df = self.df.drop(self.df.loc[self.df['name'] == 'test118.mp4'].index)
+
+        # test集（标注错误，但为了和别的论文对比，先保留着）
+        # self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu4_5.mp4'].index)
+
         print(f"--- Loaded: {len(self.df)} videos for {self.split} --- ")
 
         if cfg is not None:
-            self.num_frames = cfg.DATA.NUM_FRAMES
+            self.sample_frames = cfg.DATA.NUM_FRAMES
         else:
-            self.num_frames = 16
-
-    def get_vid_clips(self, vid_length):
-
-        """
-        get_vid_clips.
-
-        Samples `num_frames` frames clips from the given video. 
-
-        Args:
-            vid_length (int, Optional): number of frames in the entire video. If None, it will take the end of the last repetition as the end of video
-            num_frames (int, optional): number of frames to be sampled. Default is 16
-            sampling_interval (int, optional): sample one frame every N frames. Default is 4
-        """
-        if self.encode_only:
-            return np.asarray([d for d in range(0, vid_length + 1, self.sampling_interval)])
-
-        if self.sampling == 'uniform':
-            self.sampling_interval = int(vid_length / self.num_frames)
-
-        clip_duration = int(self.num_frames * self.sampling_interval)  ### clip duration 
-
-        start = randint(0, max(vid_length - clip_duration, 0))  ### sample a start frame randomly
-        idx = np.linspace(0, clip_duration, self.num_frames + 1).astype(int)[:self.num_frames]
-
-        frame_idx = start + idx
-
-        if frame_idx[-1] > vid_length:
-            frame_idx = frame_idx[frame_idx <= vid_length]  # remove indices that are grater than the length
-            frame_idx = list(islice(cycle(frame_idx), self.num_frames))  # repeat frames
-            frame_idx.sort()
-            frame_idx = np.asarray(frame_idx)
-
-        return frame_idx
+            self.sample_frames = 16
 
     def __getitem__(self, index):
-
+        # 返回视频的元信息，而不是返回具体视频帧的内容数据。视频帧数据在 train 或者 test 流程中进行读取，规避 OOM
         video_name = f"{self.data_dir}/{self.split}/{self.df.iloc[index]['name']}"
-
         row = self.df.iloc[index]
-        # 这个视频总的帧数记录在row['num_frames']，动作计数记录在 row['count']
-        duration = row['num_frames']
-        # 取每个动作开始和结束的标注（帧id）。
-        clc = [int(float(row[key])) for key in row.keys() if 'L' in key and not np.isnan(row[key])]
-        starts = clc[0::2]
-        ends = clc[1::2]
 
-        frame_idx = self.get_vid_clips(duration - 1)  ### get frame indices
+        # 每个视频总的帧数记录在row['num_frames']，重复动作次数记录在 row['count']
+        count = row['count']
+        num_frames = row['num_frames']
+
+        # 取每个动作开始和结束的标注（帧id）。
+        cycle = [int(float(row[key])) for key in row.keys() if 'L' in key and not np.isnan(row[key])]
+        starts = cycle[0::2]
+        ends = cycle[1::2]
 
         try:
             assert os.path.isfile(video_name), f"VideoLoader: {video_name} does not exist"
@@ -129,7 +105,12 @@ class Rep_count(torch.utils.data.Dataset):
         try:
             vr = VideoReader(video_name, ctx=cpu(0))
             total_frames = len(vr)
-            frame = vr.get_batch([0])
+            if count != len(starts):
+                print(f"{self.split}/{video_name} error:  action count={count}, cycles=", len(starts))
+            if num_frames != total_frames:
+                print(f"{self.split}/{video_name} error:  num_frames={num_frames}, total_frames={total_frames}")
+
+            frame = vr.get_batch([0])  # 取第一帧的信息即可
             del vr
         except:
             print("open file failed:", video_name)
@@ -138,7 +119,6 @@ class Rep_count(torch.utils.data.Dataset):
         _, H, W, c = frame.asnumpy().shape
         shape = (c, total_frames, H, W)
 
-        vdur = (frame_idx[-1] - frame_idx[0]) / row['fps']
         return shape, starts, ends, video_name
 
     def __len__(self):
@@ -154,18 +134,5 @@ if __name__ == '__main__':
 
     dataloader = torch.utils.data.DataLoader(dat, batch_size=1, num_workers=1, shuffle=False, pin_memory=False, drop_last=True)
 
-    sum_clip_dur = []
-    sum_tot_dur = []
-    sum_clip_counts = []
-    sum_tot_counts = []
-
-    fps = []
-
     for i, item in enumerate(tqdm(dataloader)):
-        sum_clip_dur.append(item[0])
-        sum_tot_dur.append(item[1])
-        sum_clip_counts.append(item[2])
-        sum_tot_counts.append(item[3])
-
-    print(f"Avg clip dur: {sum(sum_clip_dur) / len(sum_clip_dur)} | Avg vid dur: {sum(sum_tot_dur) / len(sum_tot_dur)}")
-    print(f"Avg clip reps: {sum(sum_clip_counts) / len(sum_clip_counts)} | Avg vid counts: {sum(sum_tot_counts) / len(sum_tot_counts)}")
+        pass

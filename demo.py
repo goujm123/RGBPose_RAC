@@ -25,7 +25,7 @@ def get_args_parser():
 
     parser.add_argument('--video_name', default='data/train952.mp4', type=str, help='Demo video to infer on')
     parser.add_argument('--resource', default='cuda', type=str, help='choose compute resource to use, e.g `cpu`,`cuda:0`,etc')
-    parser.add_argument('--pool_tokens', default=0.4, type=float)
+    parser.add_argument('--pool_tokens', default=1.0, type=float)
     parser.add_argument('--pretrained_encoder', default='pretrained_models/VIT_B_16x4_MAE_PT.pth', type=str)
     parser.add_argument('--scale_counts', default=100)
     parser.add_argument('--dataset', default='Repcount', help='choose from [Repcount, Countix, UCFRep]', type=str)

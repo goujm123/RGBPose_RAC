@@ -16,6 +16,7 @@ import time
 torch.manual_seed(0)
 torch.cuda.empty_cache()
 
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2 ** 32
     # worker_seed = 0
@@ -38,7 +39,7 @@ def get_args_parser():
 
     parser.add_argument('--dataset', default='RepCount', type=str, help='Repcount, Countix, UCFRep')
 
-    parser.add_argument('--get_overlapping_segments', action='store_true', help='whether to get overlapping segments')
+    parser.add_argument('--get_overlapping_segments', default=False, help='whether to get overlapping segments')
 
     parser.add_argument('--peak_at_random_locations', default=False, type=bool, help='whether to have density peaks at random locations')
 
@@ -60,12 +61,10 @@ def get_args_parser():
     parser.add_argument('--precomputed', default=True, type=lambda x: (str(x).lower() == 'true'), help='flag to specify if precomputed tokens will be loaded')
     parser.add_argument('--data_path', default='', type=str, help='dataset path')
     parser.add_argument('--slurm_job_id', default=None, type=str, help='job id')
-    
-    
-    parser.add_argument('--video_tokens_dir', default='D:/datasets/RepCount/tokens_rgb', type=str, help='ground truth density map directory')
-    parser.add_argument('--pose_tokens_dir', default='D:/datasets/RepCount/tokens_pose', type=str, help='tokens of poses')
-    # parser.add_argument('--exemplar_dir', default='D:/datasets/ESCount_4090/exemplar_VideoMAEtokens_RepCount', type=str, help='ground truth density map directory')
-    
+
+    parser.add_argument('--video_tokens_dir', default='D:/datasets/RepCount/tokens', type=str, help='ground truth density map directory')
+    parser.add_argument('--pose_tokens_dir', default='D:/datasets/RepCount/tokens', type=str, help='tokens of poses')
+
     # 选取因子p，用于设置是否在同类动作的不同视频中取数据
     parser.add_argument('--threshold', default=0, type=float, help='p, cut off to decide if select exemplar from different video')
 
@@ -125,8 +124,8 @@ def main():
                               threshold=args.threshold)
 
     dataset_valid = Rep_count(split="valid",
-                              video_tokens_dir=args.tokens_dir,
-                              pose_tokens_dir=args.exemplar_dir,
+                              video_tokens_dir=args.video_tokens_dir,
+                              pose_tokens_dir=args.pose_tokens_dir,
                               select_rand_segment=False,
                               compact=True,
                               pool_tokens_factor=args.token_pool_ratio,
@@ -134,10 +133,10 @@ def main():
                               get_overlapping_segments=args.get_overlapping_segments,
                               multishot=args.multishot,
                               density_peak_width=args.density_peak_width)
-    
+
     dataset_test = Rep_count(split="test",
-                             video_tokens_dir=args.tokens_dir,
-                             pose_tokens_dir=args.exemplar_dir,
+                             video_tokens_dir=args.video_tokens_dir,
+                             pose_tokens_dir=args.pose_tokens_dir,
                              select_rand_segment=False,
                              compact=True,
                              pool_tokens_factor=args.token_pool_ratio,
@@ -274,11 +273,11 @@ def main():
 
     for epoch in range(args.epochs):
         torch.cuda.empty_cache()
-        scheduler.step()
+        # scheduler.step()
         start_time = time.time()
 
         print(f"Epoch: {epoch:02d}")
-        for phase in ['train', 'val']:
+        for phase in ['train']:
             if phase == 'val':
                 if epoch % args.eval_freq != 0:
                     continue
@@ -308,6 +307,7 @@ def main():
                             train_step += 1
                         elif phase == 'val':
                             val_step += 1
+
                         with torch.cuda.amp.autocast(enabled=True):
                             data = item[0].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
                             example = item[1].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
@@ -406,6 +406,7 @@ def main():
                             'optimizer_state_dict': optimizer.state_dict(),
                         }, os.path.join(args.save_path, 'epoch_{}.pyth'.format(str(epoch).zfill(3))))
 
+        scheduler.step()
         used_time = time.time() - start_time
 
         print(f"Time elapsed: {int(used_time)} sec")

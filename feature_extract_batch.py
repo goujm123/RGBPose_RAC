@@ -22,7 +22,12 @@ BLAZEPOSE_CONNECTIONS = frozenset([(0, 1), (1, 2), (2, 3), (3, 7),
                                    (11, 23), (12, 24), (23, 24), (23, 25), (24, 26), (25, 27), (26, 28), (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32)])
 
 # 生成的 npz 文件存放位置
-target_dir = 'd:/datasets/RepCount/tokens'
+target_dir = 'd:/datasets/RepCount/tokens_batch'
+# 窗口覆盖 64帧，从窗口中采样 16帧 构成一个 clip（或 segment）
+window_size = 64
+sample_frames = 16
+# 根据 GPU内存情况，进行批处理。设置 16个clip构成一个chunk，但最后一个chunk可能不足16个clip
+chunk_size = 16
 
 
 def get_args_parser():
@@ -45,12 +50,23 @@ def preprocess(tensor, min_size=224, crop_size=224, video_mean=[0.485, 0.456, 0.
     T, C, H, W = tensor.shape
 
     crop = CenterCrop(crop_size)
-    resize = Resize(min_size, antialias=False)
+    resize = Resize(min_size)
     normalize = Normalize(mean=video_mean, std=video_std)
 
-    data = tensor
-    data = normalize(data)
+    data = normalize(tensor)
     data = resize(data)
+    data = crop(data)
+
+    return data
+
+
+def preprocess_pose(tensor, min_size=224, crop_size=224):
+    T, C, H, W = tensor.shape
+
+    crop = CenterCrop(crop_size)
+    resize = Resize(min_size)
+
+    data = resize(tensor)
     data = crop(data)
 
     return data
@@ -118,7 +134,7 @@ def pose_feature_extract(clip, pose_estimator):
         else:
             images.append(np.zeros((H, W, C), dtype=np.uint8))
 
-    # 为了对接后续的 Compose 处理流程
+    # 为了对接后续的 Compose 处理流程，需要调整维度格式(N,H,W,C-->N,C,H,W)
     result = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2)
 
     return result
@@ -134,8 +150,6 @@ def save_tokens(dataloaders, model, args):
          other parameters needed
     '''
 
-    window_size = 64
-    sample_frames = 16  # 每个clip （或 segment） 包含的帧数（sampling 16 frames）
     splits = ['train', 'val', 'test']
 
     if not os.path.isdir(target_dir):
@@ -158,12 +172,17 @@ def save_tokens(dataloaders, model, args):
             video_name = item[-1][0]
             base_name = os.path.basename(video_name)[:-4]
             print(f"{split}: {base_name}, total frames: {Total.numpy()}")
+
+            # 如果之前已经转换完成一部分，则保留，从剩下的开始处理
             if os.path.exists('{}/{}_rgb.npz'.format(target_dir, base_name)) and os.path.exists('{}/{}_pose.npz'.format(target_dir, base_name)):
                 continue
 
             vr = VideoReader(video_name, ctx=cpu(0))
-            rgb = []
-            pose = []
+            rgb_encoded = []
+            pose_encoded = []
+
+            rgb_chunk = []
+            pose_chunk = []
 
             for j in range(0, Total, 16):  #### 75% overlap， 每个窗口覆盖64帧，滑动窗口step为16
                 idx = np.linspace(j, j + window_size, sample_frames + 1)[:sample_frames].astype(int)  ### sample 16 frames from windows of 64 frames
@@ -178,39 +197,49 @@ def save_tokens(dataloaders, model, args):
 
                 clip = torch.cat((clip_valid, clip_padding), dim=0) if len(padding_idx) > 0 else clip_valid
 
-                # 可以先进行 pose 处理（注意 BlazePose一次只能处理一帧RGB图像，需要for each in batch）
-                with mp_pose.Pose() as pose_estimator:
-                    pose_input = pose_feature_extract(clip, pose_estimator)
-                    pose_input = preprocess(pose_input / 255.)
-                    pose_input = torch.unsqueeze(pose_input, 0).permute(0, 2, 1, 3, 4).to("cuda")
+                # pose_feature_extract（注意 BlazePose一次只能处理一帧RGB图像）
+                pose_input = pose_feature_extract(clip, pose_estimator)
+                pose_input = preprocess_pose(pose_input / 255.)
+                pose_input = pose_input.permute(1, 0, 2, 3)  # (T,C,H,W-->C,T,H,W)
 
                 # rgb_feature_extract
                 rgb_input = preprocess(clip / 255.)  # Norm, resize & crop valid frames first. shape: H*W -> 224*224
-                rgb_input = torch.unsqueeze(rgb_input, 0).permute(0, 2, 1, 3, 4).to("cuda")
+                rgb_input = rgb_input.permute(1, 0, 2, 3)
 
-                # 这里的模型为VideoMAE
-                with torch.no_grad():
-                    try:
-                        encoded_pose, thw_pose = model(pose_input)
-                        encoded_rgb, thw_rgb = model(rgb_input)  ### get encodings from pose & rgb
-                    except:
-                        print(f"video: {video_name} exception")
-                        raise Exception(1)
+                # 批量处理提高效率，一个chunk包含多个clip
+                rgb_chunk.append(rgb_input)
+                pose_chunk.append(pose_input)
 
-                    encoded_rgb = encoded_rgb.transpose(1, 2).reshape(encoded_rgb.shape[0], encoded_rgb.shape[-1], thw_rgb[0], thw_rgb[1], thw_rgb[2])  # reshape to B x C x T x H x W
-                    encoded_pose = encoded_pose.transpose(1, 2).reshape(encoded_pose.shape[0], encoded_pose.shape[-1], thw_pose[0], thw_pose[1], thw_pose[2])  # reshape to B x C x T x H x W
+                if len(rgb_chunk) >= chunk_size or j + window_size >= Total:
+                    rgb_input = torch.stack(rgb_chunk, dim=0).to("cuda")  # (C,T,H,W-->B,C,T,H,W)
+                    pose_input = torch.stack(pose_chunk, dim=0).to("cuda")
 
-                rgb.append(encoded_rgb.cpu().numpy())
-                pose.append(encoded_pose.cpu().numpy())
+                    # 使用 VideoMAE 预训练模型分别对两种输入编码
+                    with torch.no_grad():
+                        try:
+                            encoded_pose, thw_pose = model(pose_input)
+                            encoded_rgb, thw_rgb = model(rgb_input)
+                        except:
+                            print(f"VideoMAE encoding: {video_name}, exception")
+                            break
+
+                        encoded_rgb = encoded_rgb.transpose(1, 2).reshape(encoded_rgb.shape[0], encoded_rgb.shape[-1], thw_rgb[0], thw_rgb[1], thw_rgb[2])  # reshape to B x C x T x H x W
+                        encoded_pose = encoded_pose.transpose(1, 2).reshape(encoded_pose.shape[0], encoded_pose.shape[-1], thw_pose[0], thw_pose[1], thw_pose[2])  # reshape to B x C x T x H x W
+
+                    rgb_encoded.append(encoded_rgb.cpu().numpy())
+                    pose_encoded.append(encoded_pose.cpu().numpy())
+
+                    rgb_chunk.clear()
+                    pose_chunk.clear()
 
                 torch.cuda.empty_cache()
                 del clip, clip_valid, clip_padding, batch_clip, pose_input, rgb_input
 
             # 按照 float存放，每个clip的16帧图像数据编码为 (768,8,14,14)，约4.8MB
-            merged = np.concatenate(rgb, 0)
+            merged = np.concatenate(rgb_encoded, 0)
             np.savez('{}/{}_rgb.npz'.format(target_dir, base_name), merged)  ### saving as npz
 
-            merged = np.concatenate(pose, 0)
+            merged = np.concatenate(pose_encoded, 0)
             np.savez('{}/{}_pose.npz'.format(target_dir, base_name), merged)
 
             # max_reserved = torch.cuda.max_memory_reserved()
@@ -226,7 +255,7 @@ def main():
 
     cfg = load_config(args)
 
-    model = SupervisedMAE(cfg=cfg, just_encode=True, use_precomputed=False, encodings=args.encodings).cuda()
+    model = SupervisedMAE(cfg=cfg, just_encode=True, use_precomputed=False).cuda()
     if args.pretrained_encoder:
         state_dict = torch.load(args.pretrained_encoder)
         if 'model_state' in state_dict.keys():

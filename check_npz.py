@@ -1,22 +1,27 @@
 import os
 import numpy as np
 
-# full = np.load("stu1_10_full.npz")['arr_0']
-# d0 = np.load("stu1_10_0.npz")['arr_0']
-# d1 = np.load("stu1_10_1.npz")['arr_0']
-# d2 = np.load("stu1_10_2.npz")['arr_0']
-# d3 = np.load("stu1_10_3.npz")['arr_0']
-#
-# data = np.concatenate([d0, d1, d2, d3])
-# diff = np.abs(full - data)
+# 每个 clip 编码一次
+single = np.load("D:/datasets/RepCount/tokens_single/train951_pose.npz")['arr_0']
+print("data1 shape: ", single.shape)
 
-demo = np.load("D:/datasets/RepCount/tokens/stu1_0_rgb.npz")['arr_0']
-# data = np.load("train951.npz")['arr_0']
+# 多个 clip 组成 chunk，批量编码
+batch = np.load("D:/datasets/RepCount/tokens_batch/train951_pose.npz")['arr_0']
+print("data2 shape: ", batch.shape)
 
-# diff = np.abs(demo - data)
-# diff_max = np.max(diff)
-# diff_avg = np.average(diff)
+diff = np.abs(single - batch)
+diff_max = np.max(diff)   # 数值上有微小差异， 最大偏差 e-5 量级算正常的结果
+diff_avg = np.average(diff)
 
-print("Done")
+print("\n")
+print("global diff_max: ", diff_max, ", diff_avg: ", diff_avg)
+print("\n    each clip:")
 
-# 实际测试结果，分段加载（chunk_size=16） 和 一次性加载(以stu1_10.mp4为例， chunk_size设为60)数据是一致的
+for i in range(single.shape[0]):
+    b1 = single[i,:]
+    b2 = batch[i,:]
+    d = np.abs(b1 - b2)
+    d_max = np.max(d)   # 数值上有微小差异， 最大偏差 e-5 量级算正常的结果
+    d_avg = np.average(d)
+
+    print(f"d_max[{i}]: ", d_max, f", d_avg[{i}]: ", d_avg)
