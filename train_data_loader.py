@@ -22,30 +22,24 @@ class Rep_count(torch.utils.data.Dataset):
                  split="train",
                  add_noise=False,
                  num_frames=512,
-                 video_tokens_dir="D:/datasets/RepCount/tokens",
-                 pose_tokens_dir="D:/datasets/RepCount/tokens",
+                 video_tokens_dir="./tokens",
+                 pose_tokens_dir="./tokens",
                  select_rand_segment=True,
                  compact=False,
-                 lim_constraint=np.inf,
-                 pool_tokens_factor=1.0,
                  peak_at_random_location=False,
                  get_overlapping_segments=False,
-                 multishot=True,
                  density_peak_width=1.0,
                  threshold=0.0):
 
         self.num_frames = num_frames
-        self.lim_constraint = lim_constraint
         self.video_tokens_dir = video_tokens_dir
         self.pose_tokens_dir = pose_tokens_dir
         self.compact = compact
         self.select_rand_segment = select_rand_segment
-        self.pool_tokens = pool_tokens_factor
         self.split = split  # set the split to load
         self.add_noise = add_noise  # add noise to frames (augmentation)
         self.peak_at_random_location = peak_at_random_location
         self.get_overlapping_segments = get_overlapping_segments
-        self.multishot = multishot
         self.density_peak_width = density_peak_width
         self.threshold = threshold  ## cutoff to decide if we should select exemplar from other videos of same class
 
@@ -54,10 +48,16 @@ class Rep_count(torch.utils.data.Dataset):
 
         self.df = pd.read_csv(csv_path)
 
+        # 指定文件，用于调试 (这个文件有 2000多帧)
+        # self.df = self.df[self.df['name'] == 'stu1_33.mp4']
+
         # 过滤掉不符合要求的文件
         self.df = self.df[self.df['count'].notna()]
         self.df = self.df[self.df['num_frames'] > 64]
         self.df = self.df[self.df['count'] > 0]  # remove no reps
+
+        # 显存较小，超长视频训练时会导致 OOM（RTX2070 上能支持 30个分段， 1920帧），过滤掉超长的视频
+        self.df = self.df.drop(self.df.loc[self.df['num_frames'] > 1920].index)
 
         # 过滤标注错误（最常见的是count 或者 cycle标注错误）
         # train集
@@ -70,28 +70,25 @@ class Rep_count(torch.utils.data.Dataset):
 
         print(f"--- Loaded: {len(self.df)} videos for {self.split} --- ")
 
-    def load_tokens(self, path, is_pose_tokens, bounds=None, lim_constraint=np.inf, shot_num=1, get_overlapping_segments=False):
+    def load_tokens(self, path, bounds=None, get_overlapping_segments=False):
         """
         loading video or exemplar tokens. 
         input: path -> the path for the saved video/exemplar tokens
-               is_pose_tokens -> True/False for encoding pose tokens or not.
-               bounds -> (st, end) to trim video given the start and end timestamps. 
-               lim_constraint -> for memory issues, lim_constraint trims the video till this value. 
-               shot_num = (1,2,3) how many pose tokens to return
+               bounds -> (st, end) to trim video given the start and end timestamps.
 
         output:
                video/pose tokens
         """
 
         try:
-            tokens = np.load(path)['arr_0']  # Load in format B x C x T x H x W
+            tokens = np.load(path)['arr_0']  # Load in format B x 768 x 8 x 14 x 14
         except:
             print(f'Could not load {path}')
             exit(-1)
 
         if bounds is not None:
             low_bound = bounds[0] // 8
-            up_bound = min(math.ceil(bounds[1] / 8), lim_constraint)
+            up_bound = math.ceil(bounds[1] / 8)
 
         if get_overlapping_segments:  # 默认不走这个
             if self.split != 'test':
@@ -110,25 +107,17 @@ class Rep_count(torch.utils.data.Dataset):
                 tokens2 = tokens2[:, max(low_bound - 4, 0): max(up_bound - 4, 0)]
                 tokens1 = torch.from_numpy(tokens1)
                 tokens2 = torch.from_numpy(tokens2)
-            if self.pool_tokens < 1.0 and not is_pose_tokens:
-                factor = math.ceil(tokens.shape[-1] * self.pool_tokens)
-                tokens1 = torch.nn.functional.adaptive_avg_pool3d(tokens1, (tokens1.shape[-3], factor, factor))  ### spatial average pooling to fit on the gpus. set pool_tokens_factor to 1 to stop any downsampling
-                if tokens2 is not None:
-                    tokens2 = torch.nn.functional.adaptive_avg_pool3d(tokens2, (tokens2.shape[-3], factor, factor))  ###
+
             if self.split != 'test':
                 tokens = tokens1
             else:
                 tokens = (tokens1, tokens2)
 
         else:
-            tokens = tokens[0::4]  # non overlapping segments
+            tokens = tokens[0::4]  # non overlapping segments，注意每个window 覆盖64帧，step为16。这里就是取不重叠的windows
             tokens = einops.rearrange(tokens, 'S C T H W -> C (S T) H W')
-            tokens = tokens[:, low_bound:up_bound]  # 因为 bound 是 8的倍数（1个clip被编码成 8*14*14），所以实际上就是选几个 clip 的问题
-
+            tokens = tokens[:, low_bound:up_bound]  # 最后一个window可能包含较多的padding，丢弃 up_bound之后的 padding
             tokens = torch.from_numpy(tokens)
-            if self.pool_tokens < 1.0:
-                factor = math.ceil(tokens.shape[-1] * self.pool_tokens)
-                tokens = torch.nn.functional.adaptive_avg_pool3d(tokens, (tokens.shape[-3], factor, factor))
 
         return tokens
 
@@ -140,26 +129,24 @@ class Rep_count(torch.utils.data.Dataset):
 
         row = self.df.iloc[index]
         # 这个视频总的帧数记录在row['num_frames']，动作计数记录在 row['count']
-        duration = row['num_frames']
+        # duration = row['num_frames']
+        count = row['count']
+
         # 取每个动作开始和结束的标注（帧id）。
         cycle = [int(float(row[key])) for key in row.keys() if 'L' in key and not np.isnan(row[key])]  ### repetition start-end timestamps
-        starts = cycle[0::2]
-        ends = cycle[1::2]
-
-        # print(row['count'])
-        if self.split == 'train':
-            lim_constraint = 150  ### maybe have this constraint to fit into gpus
-        else:
-            lim_constraint = np.inf
 
         segment_start = row['segment_start']  # 0
         segment_end = row['segment_end']  # 总帧数
         num_frames = row['num_frames']  # 总帧数
 
         ### --- Creating density maps ---
+        # 论文4.1节，M = 1568*R/64 = (8*14*14)*R/64，相当于 1/8 下采样。R为原始总帧数，每个窗口64帧，每个窗口内的帧采样后编码为1568个tokens
+        # 下面的代码按照1/8下采样处理。对预处理的tokens来说，由于window覆盖64帧，最后一个window包含了较多的padding，1/8下采样时去掉多余的 padding
         frame_ids = np.arange(num_frames)  # 帧序列编号
-        low = (segment_start // 8) * 8
-        up = (min(math.ceil(segment_end / 8), lim_constraint)) * 8  # 与 8 的倍数对齐
+        low = (segment_start // 8) * 8  # 0，标注中的segment_start为 0
+        up = math.ceil(segment_end / 8) * 8  # 最后一个段虽然不足 8帧，但还是要采样，对齐
+
+        # 建索引 [0, 8, 16...]
         select_frame_ids = frame_ids[low:up][0::8]  # 0, 8, 16, 24...
         density_map_alt = np.zeros(len(select_frame_ids))
 
@@ -174,13 +161,13 @@ class Rep_count(torch.utils.data.Dataset):
 
             # 上一步已经对齐，因此这个条件一般是满足的
             if st in select_frame_ids and end in select_frame_ids:
-                start_id = np.where(select_frame_ids == st)[0][0]
+                start_id = np.where(select_frame_ids == st)[0][0]  # 这是下采样后的索引，不是原始帧号（索引*8 对应帧号）
                 end_id = np.where(select_frame_ids == end)[0][0]
                 mid = (start_id + end_id) // 2  ### get the middle of the repetitions
                 density_map_alt[mid] = 1  ### assign 1 to the middle of repetitions
 
         gt_density = ndimage.gaussian_filter1d(density_map_alt, sigma=self.density_peak_width, order=0)  ### gaussian smoothing
-        count = gt_density.sum()  # 看看和标注的差别（很小）
+        count_gt = gt_density.sum()  # 看看和标注的差别（很小）
 
         # 标注的帧号，每个周期的开始和结束，计算每个动作的持续帧数
         starts = np.array(cycle[0::2])
@@ -191,19 +178,17 @@ class Rep_count(torch.utils.data.Dataset):
 
         ### Load video tokens
         video_path = f"{self.video_tokens_dir}/{video_name}"
-        vid_tokens = self.load_tokens(video_path, False, (segment_start, segment_end), lim_constraint=lim_constraint, get_overlapping_segments=self.get_overlapping_segments)  ###load the video tokens. lim_constraint for memory issues
+        vid_tokens = self.load_tokens(video_path, (segment_start, segment_end), get_overlapping_segments=self.get_overlapping_segments)
 
         ### Load pose tokens
         pose_path = f"{self.pose_tokens_dir}/{pose_name}"
-        pose_tokens = self.load_tokens(pose_path, True, (segment_start, segment_end), lim_constraint=lim_constraint, get_overlapping_segments=self.get_overlapping_segments)  ###load the video tokens. lim_constraint for memory issues
-
-        shot_num = vid_tokens.shape[-3]   # 由于pose和video一一对应，取最大的 clip/segment 数
+        pose_tokens = self.load_tokens(pose_path, (segment_start, segment_end), get_overlapping_segments=self.get_overlapping_segments)
 
         # 默认走这个流程
         if not self.select_rand_segment:
             vid_tokens = vid_tokens
             gt_density = torch.from_numpy(gt_density).half()
-            return vid_tokens, pose_tokens, gt_density, gt_density.sum(), self.df.iloc[index]['name'][:-4], list(vid_tokens[0].shape[-3:]), shot_num
+            return vid_tokens, pose_tokens, gt_density, gt_density.sum(), self.df.iloc[index]['name'][:-4], list(vid_tokens[0].shape[-3:]), num_frames, count
 
         # 默认不会走下面的流程
         T = row['num_frames']  ### number of frames in the video
@@ -218,7 +203,7 @@ class Rep_count(torch.utils.data.Dataset):
         sampled_segments = einops.rearrange(sampled_segments, 'C t h w -> (t h w) C')
         gt = gt_density[(start // 4): (end // 4)]
 
-        return sampled_segments, pose_tokens, gt, gt.sum(), self.df.iloc[index]['name'][:-4], thw, shot_num
+        return sampled_segments, pose_tokens, gt, gt.sum(), self.df.iloc[index]['name'][:-4], thw, num_frames, count
 
     def __len__(self):
         return len(self.df)
@@ -243,19 +228,18 @@ class Rep_count(torch.utils.data.Dataset):
                 vids = einops.rearrange(vids, 'T B C H W -> B (T H W) C')
             else:
                 vids = einops.rearrange(vids, 'T B C H W -> B C T H W')
-        # min_examplars = min([x[1].shape[1] for x in batch])
-        # exemplars = torch.stack([x[1][:, :min_examplars] for x in batch]).squeeze(1)
-        exemplars = torch.stack([x[1] for x in batch]).squeeze(1)
+
+        poses = torch.stack([x[1] for x in batch]).squeeze(1)
         if self.compact:
-            exemplars = einops.rearrange(exemplars, 'B C T H W -> B (T H W) C')
+            poses = einops.rearrange(poses, 'B C T H W -> B (T H W) C')
         gt_density = einops.rearrange(pad_sequence([x[2] for x in batch]), 'S B -> B S')
         gt_density_sum = torch.tensor([x[3] for x in batch], dtype=torch.float)
         names = [x[4] for x in batch]
         thw = [x[5] for x in batch]
-        shot_num = [x[6] for x in batch]
+        num_frames = [x[6] for x in batch]
+        count = [x[7] for x in batch]
 
-        # return padded video, exemplar, padded density map,
-        return vids, exemplars, gt_density, gt_density_sum, names, thw, shot_num
+        return vids, poses, gt_density, gt_density_sum, names, thw, num_frames, count
 
 
 ## testing

@@ -81,7 +81,7 @@ class SupervisedMAE(nn.Module):
                  embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=2, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, just_encode=False,
-                 use_precomputed=True, token_pool_ratio=1.0, iterative_shots=False, encodings='mae', no_exemplars=False, window_size=(3, 3, 3)):
+                 use_precomputed=True, token_pool_ratio=1.0, iterative_shots=False, encodings='mae', window_size=(3, 3, 3)):
 
         super().__init__()
 
@@ -301,8 +301,7 @@ class SupervisedMAE(nn.Module):
 
         # CrossAttentionBlocks
         self.decoder_blocks = nn.ModuleList([
-            CrossAttentionBlock(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer, drop_path=0,
-                                iterative_shots=self.iterative_shots, no_exemplars=no_exemplars)
+            CrossAttentionBlock(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer, drop_path=0)
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
@@ -464,10 +463,7 @@ class SupervisedMAE(nn.Module):
 
         return x, thw
 
-    def forward(self, vid, yi=None, thw=None, boxes=None, shot_num=1):
-        # video, pose/examplar， thw=[[N,14,14]], shot_num
-        y1 = []
-
+    def forward(self, vid, yi=None, thw=None, boxes=None):
         ### extract latent representations
         if not self.use_precomputed:  # 训练的时候 use_precomputed 为 True，不走这个流程，可以忽略
             with torch.no_grad():
@@ -490,17 +486,12 @@ class SupervisedMAE(nn.Module):
 
         x = x + pos_embed
 
-        if shot_num > 0:
-            yi = self.decoder_embed(yi)
-            N, _, C = yi.shape
-
-            y = yi
-
-        else:  ### use 0-shot token if shot_num>0
-            y = self.shot_token.unsqueeze(0).repeat(x.shape[0], 1, 1).to(x.device)  ## zero-shot token repeat
+        yi = self.decoder_embed(yi)
+        N, _, C = yi.shape
+        y = yi
 
         for blk in self.decoder_blocks:  ### cross-attention blocks
-            x = blk(x, y, shot_num=max(shot_num, 1))
+            x = blk(x, y)
 
         x = self.decoder_norm(x)
 

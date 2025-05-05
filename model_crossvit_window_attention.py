@@ -409,16 +409,16 @@ class CrossAttention(nn.Module):
 class CrossAttentionBlock(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, iterative_shots=False, no_exemplars=False):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
 
         self.norm0 = norm_layer(dim)
-        self.selfattn = SelfAttention(dim)
+        self.self_attn = SelfAttention(dim)
 
         self.drop_path0 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm1 = norm_layer(dim)
-        self.attn = CrossAttentionB(dim)
+        self.cross_attn = CrossAttentionB(dim)
 
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -426,24 +426,10 @@ class CrossAttentionBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout=0.0)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.iterative_shots = iterative_shots
-        self.no_exemplars = no_exemplars
 
-    def forward(self, x, y, shot_num=1):
-        x = x + self.drop_path0(self.selfattn(x))
-        if not self.no_exemplars:
-            x_few = []
-            if self.iterative_shots:
-
-                for i in range(shot_num):  # running iterations over shots
-                    nt = y.shape[1] // shot_num  ##number of example tokens per example
-                    yi = y[:, (i * nt):((i + 1) * nt)]  ##separating example tokens
-                    xi = self.drop_path1(self.attn(x, yi))  ### cross-attending between exemplars and video
-                    x_few.append(xi)
-                x = x + torch.stack(x_few).mean(0)
-            else:
-                x = x + self.drop_path1(self.attn(self.norm1(x), y))
-                
+    def forward(self, x, y):
+        x = x + self.drop_path0(self.self_attn(x))
+        x = x + self.drop_path1(self.cross_attn(self.norm1(x), y))
         x = x + self.drop_path2(self.mlp(x))
         return x
 
