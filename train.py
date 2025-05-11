@@ -321,6 +321,7 @@ def main():
         torch.cuda.empty_cache()
         # scheduler.step()   # 新版本的torch中， scheduler.step() 要放到 optimizer.step() 后
         start_time = time.time()
+        optimizer.zero_grad()
 
         print(f"Epoch: {epoch:02d}")
         for phase in ['train', 'val']:
@@ -357,73 +358,80 @@ def main():
                         video_name = item[4][0]
                         total_frames = item[6][0]
                         count_gt = item[7][0]
-                        print(f"  video name: {video_name}, total_frames: {total_frames}, action counts: {int(count_gt)}")
+                        print(f"  video: {video_name}, frames: {total_frames}, counts: {int(count_gt)}")
 
                         with torch.cuda.amp.autocast(enabled=True):
                             rgb = item[0].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C，视频每8帧采样1帧，每帧编码为14*14 tokens，每个token编码为768维向量
                             pose = item[1].cuda().type(torch.cuda.FloatTensor)  # B x (THW) x C
                             density_map = item[2].cuda().type(torch.cuda.FloatTensor).half() * args.scale_counts  # (B, T)
+
                             actual_counts = item[3].cuda()  # tensor:(1,),  B x 1
                             thw = item[5]  # 对于B=1，list为 [[T,H,W]] i.e. [[53,14,14]]
 
                             T, H, W = thw[0][0], thw[0][1], thw[0][2]
-                            b, n, c = rgb.shape
+                            b, n, c = rgb.shape  #在目前我们的设置中，b=1，c=768，n=采样帧的总token数（N*14*14）
 
-                            # 按时间维度对 T 分段，将数据分成更小的segment，规避 GPU OOM
-                            chunk_size = 8  # 每个chunk包含的帧数（已经1/8下采样），可根据 GPU 内存调整
+                            # 按时间维度对 T 分段，将数据分成更小的 segment，规避 GPU OOM
+                            # 梯度累积（Gradient Accumulation）将一个大批量（batch）拆分为多个小批量（mini-batch），在每个小批量上进行前向传播和反向传播，
+                            # 但不立即更新模型参数，而是将梯度累加。待累积到预设步数后，用累积的梯度统一更新参数
+                            chunk_size = 16  # 每个chunk包含的帧数（已经1/8下采样），可根据 GPU 内存调整
                             num_segments = math.ceil(T / chunk_size)  # 计算总segment数
+                            predict_counts = 0
 
-                            sum_y = torch.empty((density_map.shape[0], 0)).cuda()
                             for j in range(num_segments):
                                 start = j * chunk_size
                                 end = min((j + 1) * chunk_size, T)
                                 rgb_seg = rgb[:, start * H * W:end * H * W, :]
                                 pose_seg = pose[:, start * H * W:end * H * W, :]
+                                density_seg = density_map[:, start:end]
+                                density_seg_sum = torch.sum(density_seg, 1)
+
                                 thw_seg = [[end - start, H, W]]  # 更新分段后的thw
 
                                 y = model(rgb_seg, pose_seg, thw_seg)
-                                sum_y = torch.cat((sum_y, y), dim=1)
+
+                                if phase == 'train':
+                                    mask = np.random.binomial(n=1, p=0.8, size=[1, density_seg.shape[1]])  ### random masking of 20% density map
+                                else:
+                                    mask = np.ones([1, density_seg.shape[1]])
+
+                                masks = np.tile(mask, (density_seg.shape[0], 1))
+
+                                masks = torch.from_numpy(masks).cuda()
+                                loss = ((y - density_seg) ** 2)
+                                loss = ((loss * masks) / density_seg.shape[1]).sum() / density_seg.shape[0]  # 这一步是做啥？ loss 变成了标量
+
+                                predict_count = torch.sum(y, dim=1).type(torch.cuda.FloatTensor) / args.scale_counts  # sum density map
+                                predict_counts += predict_count
+                                # loss_mse = torch.mean((predict_count - actual_counts)**2)
+
+                                if phase == 'val':
+                                    ground_truth.append(actual_counts.detach().cpu().numpy())
+                                    predictions.append(predict_count.detach().cpu().numpy())
+
+                                loss2 = lossSL1(predict_count, density_seg_sum)  ### L1 loss between count and predicted count
+                                loss3 = torch.sum(torch.div(torch.abs(predict_count - density_seg_sum), density_seg_sum + 0.1)) / predict_count.flatten().shape[0]  #### reduce the mean absolute error (mae loss)
+
+                                if phase == 'train':
+                                    loss1 = (loss + 1.0 * loss3) # / num_segments  # 标准化loss，梯度累积步数 num_segments（需不需要做这个除法？）
+                                    loss1.backward()  # 累积梯度
+
+                                # 累积
+                                total_loss_all += loss.item()
+                                total_loss1 += loss1.item()
+                                total_loss2 += loss2.item()
+                                total_loss3 += loss3.item()
 
                             if phase == 'train':
-                                mask = np.random.binomial(n=1, p=0.8, size=[1, density_map.shape[1]])  ### random masking of 20% density map
-                            else:
-                                mask = np.ones([1, density_map.shape[1]])
+                                optimizer.step()  # 完成了这个视频的各段数据处理和梯度累积，更新参数
+                                optimizer.zero_grad()  # 清空梯度
+                                torch.cuda.empty_cache()
 
-                            masks = np.tile(mask, (density_map.shape[0], 1))
-
-                            masks = torch.from_numpy(masks).cuda()
-                            loss = ((sum_y - density_map) ** 2)
-                            loss = ((loss * masks) / density_map.shape[1]).sum() / density_map.shape[0]
-
-                            predict_count = torch.sum(sum_y, dim=1).type(torch.cuda.FloatTensor) / args.scale_counts  # sum density map
-                            # loss_mse = torch.mean((predict_count - actual_counts)**2)
-
-                            if phase == 'val':
-                                ground_truth.append(actual_counts.detach().cpu().numpy())
-                                predictions.append(predict_count.detach().cpu().numpy())
-
-                            loss2 = lossSL1(predict_count, actual_counts)  ### L1 loss between count and predicted count
-                            loss3 = torch.sum(torch.div(torch.abs(predict_count - actual_counts), actual_counts + 1e-1)) / \
-                                    predict_count.flatten().shape[0]  #### reduce the mean absolute error (mae loss)
-
-                            if phase == 'train':
-                                loss1 = (loss + 1.0 * loss3) / args.accum_iter  ### mse between density maps + mae loss (loss3)
-                                loss1.backward()  ### call backward
-                                if (i + 1) % args.accum_iter == 0:  ### accumulate gradient
-                                    optimizer.step()  ##update parameters
-                                    optimizer.zero_grad()
-                                    torch.cuda.empty_cache()
-
-                            epoch_loss = loss.item()
                             count += b
-                            total_loss_all += loss.item() * b
-                            total_loss1 += loss.item() * b
-                            total_loss2 += loss2.item() * b
-                            total_loss3 += loss3.item() * b
-                            off_by_zero += (torch.abs(actual_counts.round() - predict_count.round()) == 0).sum().item()  ## off by zero
-                            off_by_one += (torch.abs(actual_counts.round() - predict_count.round()) <= 1).sum().item()  ## off by one
-                            mse += ((actual_counts - predict_count.round()) ** 2).sum().item()
-                            mae += torch.sum(torch.div(torch.abs(predict_count.round() - actual_counts), (actual_counts) + 1e-1)).item()  ##mean absolute error
+                            off_by_zero += (torch.abs(actual_counts.round() - predict_counts.round()) == 0).sum().item()  ## off by zero
+                            off_by_one += (torch.abs(actual_counts.round() - predict_counts.round()) <= 1).sum().item()  ## off by one
+                            mse += ((actual_counts - predict_counts.round()) ** 2).sum().item()
+                            mae += torch.sum(torch.div(torch.abs(predict_counts.round() - actual_counts), (actual_counts) + 1e-1)).item()  ##mean absolute error
 
                             pbar.set_description(f"EPOCH: {epoch:02d} | PHASE: {phase} ")
                             pbar.set_postfix_str(
