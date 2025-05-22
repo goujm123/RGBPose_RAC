@@ -124,6 +124,11 @@ def pose_feature_extract(clip, pose_estimator):
     return result
 
 
+def pose_feature_extract_vitpose(clip):
+    
+    pass
+
+
 def save_tokens(dataloaders, model, args):
     '''
     This function extracts the encodings for each video using windows of 64 frames and then sampling 16 frames uniformly from these windows.

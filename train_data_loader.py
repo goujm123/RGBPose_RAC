@@ -48,22 +48,23 @@ class Rep_count(torch.utils.data.Dataset):
 
         self.df = pd.read_csv(csv_path)
 
-        # 指定文件，用于调试 (这个文件有 2000多帧)
-        # self.df = self.df[self.df['name'] == 'stu1_33.mp4']
-
         # 过滤掉不符合要求的文件
         self.df = self.df[self.df['count'].notna()]
         self.df = self.df[self.df['num_frames'] > 64]
         self.df = self.df[self.df['count'] > 0]  # remove no reps
 
         # 显存较小，超长视频训练时会导致 OOM（RTX2070 上能支持 30个分段， 1920帧），过滤掉超长的视频
-        self.df = self.df.drop(self.df.loc[self.df['num_frames'] > 1920].index)
+        # self.df = self.df.drop(self.df.loc[self.df['num_frames'] > 1920].index)
 
         # 过滤标注错误（最常见的是count 或者 cycle标注错误）
         # train集
         self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu1_10.mp4'].index)
         self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu4_3.mp4'].index)
         self.df = self.df.drop(self.df.loc[self.df['name'] == 'test118.mp4'].index)
+
+        # 指定文件，用于调试 (这个文件有 2000多帧)
+        self.df = self.df[(self.df['name'] == 'stu1_22.mp4') | (self.df['name'] == 'stu2_57.mp4')]
+        
 
         # test集（标注错误，但为了和别的论文对比，先保留着）
         # self.df = self.df.drop(self.df.loc[self.df['name'] == 'stu4_5.mp4'].index)

@@ -10,6 +10,17 @@ import argparse
 import tqdm
 from torchvision.transforms import Resize, CenterCrop, Normalize, Compose
 
+import mmcv
+import torch
+from mmcv import Config, DictAction
+from mmcv.cnn import fuse_conv_bn
+from mmcv.runner import get_dist_info, init_dist, load_checkpoint
+
+from mmpose.apis import multi_gpu_test, single_gpu_test
+from mmpose.datasets import build_dataloader, build_dataset
+from mmpose.models import build_posenet
+from mmpose.utils import setup_multi_processes
+
 from mediapipe.python.solutions import pose as mp_pose
 import einops
 
@@ -138,6 +149,12 @@ def pose_feature_extract(clip, pose_estimator):
     result = torch.from_numpy(np.stack(images)).permute(0, 3, 1, 2)
 
     return result
+
+
+def pose_feature_extract_vitpose(clip):
+    B, C, H, W = clip.shape
+    images = []
+    
 
 
 def save_tokens(dataloaders, model, args):

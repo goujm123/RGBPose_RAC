@@ -48,7 +48,8 @@ def get_args_parser():
     parser.add_argument('--density_peak_width', default=0.5, type=float, help='sigma for the peak of density maps, lesser sigma gives sharp peaks')
 
     # Model parameters
-    parser.add_argument('--save_path', default='./saved_models_repcountfull', type=str, help="Path to save the model")
+    parser.add_argument('--save_path', default='./checkpoints', type=str, help="Path to save the model")
+    parser.add_argument('--load_best_model', default=True, type=str, help="Whether to load the saved best model")
 
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05, help='weight decay (default: 0.05)')
@@ -83,7 +84,7 @@ def get_args_parser():
     # Logging parameters
     parser.add_argument('--log_dir', default='./logs/fim6_dir', help='path where to tensorboard log')
     parser.add_argument("--title", default="", type=str)
-    parser.add_argument("--use_wandb", default=False, type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument("--use_wandb", default=True, type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument("--wandb", default="", type=str)
     parser.add_argument("--team", default="", type=str)
     parser.add_argument("--wandb_id", default='', type=str)
@@ -92,64 +93,6 @@ def get_args_parser():
     parser.add_argument("--window_size", default=(4, 7, 7), type=int, nargs='+', help='window size for windowed self attention')
 
     return parser
-
-
-# 此函数为 AI 生成代码，供参考
-def train_one_epoch(model, dataloader, optimizer, device, chunk_size=8, accum_iter=4):
-    model.train()
-    loss_fn = nn.MSELoss().to(device)
-    scaler = torch.cuda.amp.GradScaler()
-    optimizer.zero_grad()
-    for i, item in enumerate(tqdm(dataloader)):
-        rgb = item[0].to(device)  # (B, THW, C)
-        pose = item[1].to(device)
-        density_map = item[2].to(device)  # (B, T)
-        actual_counts = item[3].to(device)  # (B, 1)
-        thw = item[5]  # [[T, H, W]]
-        T, H, W = thw[0][0], thw[0][1], thw[0][2]
-        b, n, c = rgb.shape
-
-        # 分段处理
-        num_segments = math.ceil(T / chunk_size)
-        sum_y = torch.empty((b, 0), device=device)
-        for j in range(num_segments):
-            start = j * chunk_size
-            end = min((j + 1) * chunk_size, T)
-            rgb_seg = rgb[:, start * H * W:end * H * W, :]
-            pose_seg = pose[:, start * H * W:end * H * W, :]
-            density_seg = density_map[:, start:end]
-            thw_seg = [[end - start, H, W]]
-
-            with torch.cuda.amp.autocast():
-                y = model(rgb_seg, pose_seg, thw_seg)  # (B, end-start)
-            sum_y = torch.cat((sum_y, y), dim=1)
-
-        # loss计算
-        mask = np.random.binomial(n=1, p=0.8, size=[1, density_map.shape[1]])
-        masks = np.tile(mask, (b, 1))
-        masks = torch.from_numpy(masks).to(device)
-        loss = ((sum_y - density_map) ** 2)
-        loss = ((loss * masks) / density_map.shape[1]).sum() / b
-
-        # 梯度累积
-        loss = loss / accum_iter
-        scaler.scale(loss).backward()
-        if (i + 1) % accum_iter == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            torch.cuda.empty_cache()
-
-        # 可选：打印loss
-        if (i + 1) % 10 == 0:
-            print(f"Iter {i + 1}, Loss: {loss.item() * accum_iter:.4f}")
-
-        # epoch结束后，若最后一批未到accum_iter也要更新
-        if (i + 1) % accum_iter != 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            torch.cuda.empty_cache()
 
 
 def main():
@@ -315,9 +258,21 @@ def main():
     lossSL1 = nn.SmoothL1Loss().cuda()
     best_loss = np.inf
 
+    if args.load_best_model:
+        try:
+            file = os.path.join(args.save_path, 'best_1.pth')
+            checkpoint = torch.load(file, map_location='cpu')
+            model.load_state_dict(checkpoint['model_state_dict'])
+            if 'optimizer_state_dict' in checkpoint and 'epoch' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                args.start_epoch = checkpoint['epoch'] + 1 
+        except FileNotFoundError:
+            print("ModelNotFound: The saved best model is not found. The code will train the model from scratch instead.")
+            args.start_epoch = 0
+
     os.makedirs(args.save_path, exist_ok=True)
 
-    for epoch in range(args.epochs):
+    for epoch in range(args.start_epoch, args.epochs):
         torch.cuda.empty_cache()
         # scheduler.step()   # 新版本的torch中， scheduler.step() 要放到 optimizer.step() 后
         start_time = time.time()
@@ -369,7 +324,7 @@ def main():
                             thw = item[5]  # 对于B=1，list为 [[T,H,W]] i.e. [[53,14,14]]
 
                             T, H, W = thw[0][0], thw[0][1], thw[0][2]
-                            b, n, c = rgb.shape  #在目前我们的设置中，b=1，c=768，n=采样帧的总token数（N*14*14）
+                            b, n, c = rgb.shape  # 在目前我们的设置中，b=1，c=768，n=采样帧的总token数（N*14*14）
 
                             # 按时间维度对 T 分段，将数据分成更小的 segment，规避 GPU OOM
                             # 梯度累积（Gradient Accumulation）将一个大批量（batch）拆分为多个小批量（mini-batch），在每个小批量上进行前向传播和反向传播，
@@ -413,7 +368,7 @@ def main():
                                 loss3 = torch.sum(torch.div(torch.abs(predict_count - density_seg_sum), density_seg_sum + 0.1)) / predict_count.flatten().shape[0]  #### reduce the mean absolute error (mae loss)
 
                                 if phase == 'train':
-                                    loss1 = (loss + 1.0 * loss3) # / num_segments  # 标准化loss，梯度累积步数 num_segments（需不需要做这个除法？）
+                                    loss1 = (loss + 1.0 * loss3)  # / num_segments  # 标准化loss，梯度累积步数 num_segments（需不需要做这个除法？）
                                     loss1.backward()  # 累积梯度
 
                                 # 累积
@@ -473,11 +428,11 @@ def main():
                                 'epoch': epoch,
                                 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
-                            }, os.path.join(args.save_path, 'best_1.pyth'))
+                            }, os.path.join(args.save_path, 'best_1.pth'))
                         torch.save({
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
-                        }, os.path.join(args.save_path, 'epoch_{}.pyth'.format(str(epoch).zfill(3))))
+                        }, os.path.join(args.save_path, 'epoch_{}.pth'.format(str(epoch).zfill(3))))
 
         scheduler.step()
         used_time = time.time() - start_time
